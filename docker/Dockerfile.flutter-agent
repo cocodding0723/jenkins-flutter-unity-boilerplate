@@ -1,0 +1,114 @@
+# ============================================================
+# Dockerfile.flutter-agent
+# Jenkins inbound-agent with Flutter SDK + Android SDK + Node.js
+# Base: Ubuntu 22.04 LTS
+# Usage: referenced in docker-compose.yml as the flutter-agent service
+# ============================================================
+
+FROM ubuntu:22.04
+
+# ── Build-time args ──────────────────────────────────────────────────────────
+ARG FLUTTER_VERSION=3.22.2
+ARG ANDROID_CMDLINE_TOOLS_VERSION=11076708
+ARG JAVA_VERSION=17
+ARG NODE_VERSION=20
+ARG JENKINS_AGENT_VERSION=3256.v88a_f6e922152
+ARG JENKINS_AGENT_WORKDIR=/home/jenkins/agent
+
+# ── Environment ──────────────────────────────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    JAVA_HOME=/usr/lib/jvm/java-${JAVA_VERSION}-openjdk-amd64 \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    ANDROID_HOME=/opt/android-sdk \
+    FLUTTER_HOME=/opt/flutter \
+    PUB_CACHE=/var/cache/pub \
+    PATH="/opt/flutter/bin:/opt/flutter/bin/cache/dart-sdk/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/build-tools/34.0.0:${PATH}"
+
+# ── System dependencies ───────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        locales \
+        curl wget unzip git git-lfs xz-utils zip \
+        openjdk-${JAVA_VERSION}-jdk-headless \
+        build-essential cmake libglu1-mesa \
+        libpulse0 libasound2 \
+        lcov \
+        ca-certificates gnupg lsb-release \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js (for firebase-tools) ──────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version \
+    && npm --version
+
+# ── firebase-tools ───────────────────────────────────────────────────────────
+RUN npm install -g firebase-tools \
+    && firebase --version
+
+# ── Android SDK (command-line tools) ──────────────────────────────────────────
+RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools \
+    && curl -sSL \
+        "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" \
+        -o /tmp/cmdline-tools.zip \
+    && unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-raw \
+    && mv /tmp/cmdline-tools-raw/cmdline-tools ${ANDROID_SDK_ROOT}/cmdline-tools/latest \
+    && rm -rf /tmp/cmdline-tools.zip /tmp/cmdline-tools-raw
+
+# Accept licenses and install SDK components
+RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true \
+    && sdkmanager \
+        "platform-tools" \
+        "platforms;android-34" \
+        "build-tools;34.0.0" \
+        "ndk;26.1.10909125" \
+    && yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+# ── Flutter SDK ───────────────────────────────────────────────────────────────
+RUN git clone \
+        --depth 1 \
+        --branch "${FLUTTER_VERSION}" \
+        https://github.com/flutter/flutter.git \
+        ${FLUTTER_HOME} \
+    && flutter --version \
+    && flutter precache --android \
+    && yes | flutter doctor --android-licenses > /dev/null 2>&1 || true \
+    && flutter doctor -v
+
+# ── Jenkins agent JAR ─────────────────────────────────────────────────────────
+RUN mkdir -p /usr/share/jenkins \
+    && curl -sSL \
+        "https://repo.jenkins-ci.org/public/org/jenkins-ci/main/remoting/${JENKINS_AGENT_VERSION}/remoting-${JENKINS_AGENT_VERSION}.jar" \
+        -o /usr/share/jenkins/agent.jar \
+    && chmod 644 /usr/share/jenkins/agent.jar
+
+# ── jenkins user (uid 1000 matches Jenkins controller expectation) ─────────────
+RUN groupadd -g 1000 jenkins \
+    && useradd  -u 1000 -g 1000 -m -s /bin/bash jenkins \
+    && mkdir -p ${JENKINS_AGENT_WORKDIR} ${PUB_CACHE} \
+    && chown -R jenkins:jenkins \
+        ${FLUTTER_HOME} \
+        ${ANDROID_SDK_ROOT} \
+        ${JENKINS_AGENT_WORKDIR} \
+        ${PUB_CACHE}
+
+USER jenkins
+WORKDIR ${JENKINS_AGENT_WORKDIR}
+
+# ── Smoke test ─────────────────────────────────────────────────────────────────
+RUN flutter --version && dart --version
+
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
+# Runtime env vars (set in docker-compose.yml or jenkins-agent config):
+#   JENKINS_URL        — e.g. http://jenkins:8080
+#   JENKINS_SECRET     — agent connection secret from Jenkins UI
+#   JENKINS_AGENT_NAME — node name registered in Jenkins
+CMD ["java", \
+     "-jar", "/usr/share/jenkins/agent.jar", \
+     "-url",    "${JENKINS_URL}", \
+     "-secret", "${JENKINS_SECRET}", \
+     "-name",   "${JENKINS_AGENT_NAME}", \
+     "-workDir", "/home/jenkins/agent"]

@@ -1,0 +1,140 @@
+# ============================================================
+# docker-compose.yml — Jenkins controller + Flutter Linux agent
+#
+# IMPORTANT: The Unity export agent CANNOT be containerised.
+# It must be a physical Windows machine with Unity Hub + Editor
+# installed, registered in Jenkins as a permanent agent with
+# the label 'unity'. See README.md for setup instructions.
+#
+# Usage:
+#   cp .env.example .env          # fill in FLUTTER_AGENT_SECRET
+#   docker-compose up -d          # start Jenkins + flutter agent
+#   docker-compose logs -f        # tail logs
+# ============================================================
+
+version: '3.9'
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  jenkins_home:
+    # Persistent Jenkins controller data: jobs, plugins, credentials, build history
+  pub_cache:
+    # Shared Dart/Flutter pub-cache for faster dependency resolution on the agent
+  android_sdk_cache:
+    # Android SDK cache shared across agent restarts
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  jenkins_net:
+    driver: bridge
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── Jenkins controller ──────────────────────────────────────────────────────
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: jenkins-controller
+    restart: unless-stopped
+
+    environment:
+      JAVA_OPTS: >-
+        -Djenkins.install.runSetupWizard=false
+        -Dorg.jenkinsci.plugins.durabletask.BourneShellScript.HEARTBEAT_CHECK_INTERVAL=86400
+      JENKINS_OPTS: --argumentsRealm.passwd.admin=admin --argumentsRealm.roles.admin=admin
+
+    ports:
+      - "8080:8080"    # Web UI
+      - "50000:50000"  # JNLP agent port
+
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      # Uncomment to pin plugins via plugins.txt:
+      # - ./jenkins/plugins.txt:/usr/share/jenkins/ref/plugins.txt:ro
+      # Uncomment to use Jenkins Configuration as Code (JCasC):
+      # - ./jenkins/casc.yaml:/var/jenkins_home/casc_configs/casc.yaml:ro
+
+    networks:
+      - jenkins_net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Flutter Linux agent ──────────────────────────────────────────────────────
+  flutter-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.flutter-agent
+      args:
+        FLUTTER_VERSION: "3.22.2"
+        JAVA_VERSION: "17"
+        NODE_VERSION: "20"
+    image: jenkins-flutter-agent:latest
+    container_name: jenkins-flutter-agent
+    restart: unless-stopped
+    depends_on:
+      jenkins:
+        condition: service_healthy
+
+    environment:
+      # These must match the agent node configured in Jenkins > Manage Nodes
+      JENKINS_URL:        "http://jenkins:8080"
+      JENKINS_AGENT_NAME: "flutter-agent-01"
+      # FLUTTER_AGENT_SECRET comes from .env file
+      # Get it from Jenkins: Manage Nodes > flutter-agent-01 > (agent secret)
+      JENKINS_SECRET: "${FLUTTER_AGENT_SECRET}"
+
+    volumes:
+      # Persistent pub cache — dramatically speeds up flutter pub get
+      - pub_cache:/var/cache/pub
+      # Persistent Android SDK cache
+      - android_sdk_cache:/opt/android-sdk
+
+    networks:
+      - jenkins_net
+
+    # Resource limits — adjust to your host machine capacity
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: '8G'
+        reservations:
+          cpus: '1.0'
+          memory: '2G'
+
+# ── Unity Windows agent (NOT containerised) ─────────────────────────────────
+#
+#  The Unity export pipeline requires a physical Windows machine because:
+#    1. Unity Editor has no Linux support for Android Gradle export
+#    2. Unity batch mode -nographics still requires Windows GDI subsystem
+#    3. Git LFS with large binary assets performs poorly in Docker for Windows
+#
+#  Manual setup for the Windows Unity agent:
+#    1. Install Unity Hub:  https://unity.com/download
+#    2. Install Unity Editor 2022.3.61f1 via Unity Hub
+#       (include Android Build Support + Android SDK & NDK Tools modules)
+#    3. Install Git + Git LFS:  https://git-lfs.com
+#    4. Install Java 17:  winget install Microsoft.OpenJDK.17
+#    5. Register the node in Jenkins:
+#         Manage Jenkins > Nodes > New Node
+#         Name: unity-agent-01
+#         Labels: unity
+#         Remote root directory: C:\jenkins\workspace
+#         Launch method: "Launch agent by connecting to the controller"
+#    6. Download agent.jar from:
+#         http://YOUR_JENKINS_URL/jnlpJars/agent.jar
+#    7. Connect the agent:
+#         java -jar agent.jar ^
+#           -url http://YOUR_JENKINS_URL ^
+#           -secret <NODE_SECRET> ^
+#           -name unity-agent-01 ^
+#           -workDir C:\jenkins\workspace
+#    8. (Recommended) Install as a Windows Service using NSSM:
+#         nssm install JenkinsUnityAgent java
+#         nssm set JenkinsUnityAgent AppParameters -jar C:\jenkins\agent.jar -url ... -secret ... -name ...
+#         nssm start JenkinsUnityAgent

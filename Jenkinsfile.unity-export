@@ -1,0 +1,524 @@
+// ============================================================
+// Jenkinsfile.unity-export — Unity batch export pipeline
+// Runs on a Windows agent labeled 'unity'
+// Exports unityLibrary AAR and commits it back to the Flutter repo
+// ============================================================
+
+pipeline {
+    agent { label 'unity' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 90, unit: 'MINUTES')
+        skipDefaultCheckout()
+        // Do NOT use disableConcurrentBuilds — we handle locking ourselves
+        ansiColor('xterm')
+    }
+
+    parameters {
+        booleanParam(
+            name: 'FORCE_EXPORT',
+            defaultValue: false,
+            description: 'Force Unity export even if Unity SHA is unchanged'
+        )
+        string(
+            name: 'UNITY_BRANCH',
+            defaultValue: 'main',
+            description: 'Branch of the Unity repo to export from'
+        )
+    }
+
+    environment {
+        // ── Repo URLs ─────────────────────────────────────────────────
+        FLUTTER_REPO_URL    = 'YOUR_FLUTTER_REPO_URL'
+        UNITY_REPO_URL      = 'YOUR_UNITY_REPO_URL'
+        APP_NAME            = 'YOUR_APP_NAME'
+
+        // ── Unity installation path ───────────────────────────────────
+        // Adjust to the exact Unity version installed on this agent
+        UNITY_EXE           = 'YOUR_UNITY_EXE_PATH'
+        // Default: C:\Program Files\Unity\Hub\Editor\2022.3.61f1\Editor\Unity.exe
+
+        // ── Git credentials ───────────────────────────────────────────
+        GIT_CRED_ID         = 'github-token'       // Username+Password or SSH credential ID
+
+        // ── Workspace paths ───────────────────────────────────────────
+        // Flutter workspace is checked out by Jenkins (scm)
+        UNITY_WORKSPACE     = 'C:\\jenkins\\unity-workspace\\YOUR_APP_NAME'
+        UNITY_LIB_DEST      = 'android\\unityLibrary'
+        SHA_TRACKING_FILE   = '.unity-exported-sha'
+        LOCK_STALE_SECONDS  = '3600'
+
+        // ── Export log ────────────────────────────────────────────────
+        UNITY_LOG_FILE      = 'unity-export.log'
+    }
+
+    stages {
+
+        // ── 1. CHECKOUT FLUTTER REPO ──────────────────────────────────
+        stage('Checkout Flutter Repo') {
+            steps {
+                checkout scm
+                script {
+                    env.FLUTTER_SHA       = powershell(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.FLUTTER_SHA_SHORT = env.FLUTTER_SHA.take(8)
+                    env.FLUTTER_BRANCH    = powershell(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+                    echo "Flutter repo: branch=${env.FLUTTER_BRANCH}  sha=${env.FLUTTER_SHA_SHORT}"
+                }
+            }
+        }
+
+        // ── 2. CLONE / UPDATE UNITY REPO ─────────────────────────────
+        stage('Sync Unity Repo') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(
+                        credentialsId: "${GIT_CRED_ID}",
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_PASS'
+                    )]) {
+                        powershell """
+                            \$ErrorActionPreference = 'Stop'
+                            \$unityWs = '${UNITY_WORKSPACE}'
+                            \$unityBranch = '${params.UNITY_BRANCH}'
+                            \$repoUrl = '${UNITY_REPO_URL}'
+
+                            # Strip https:// prefix to inject credentials
+                            \$repoNoScheme = \$repoUrl -replace '^https?://', ''
+                            \$credUrl = "https://\$(\$env:GIT_USER):\$(\$env:GIT_PASS)@\$repoNoScheme"
+
+                            if (Test-Path "\$unityWs\\.git") {
+                                Write-Host "Unity workspace exists -- fetching incremental updates"
+                                Set-Location \$unityWs
+
+                                git remote set-url origin \$credUrl
+                                git fetch origin --prune
+                                git checkout \$unityBranch
+                                git reset --hard "origin/\$unityBranch"
+
+                                # Pull Git LFS objects for changed files
+                                git lfs pull
+                            } else {
+                                Write-Host "Unity workspace missing -- cloning fresh (LFS enabled)"
+                                New-Item -ItemType Directory -Force -Path (Split-Path \$unityWs -Parent) | Out-Null
+
+                                # Ensure LFS hooks are installed system-wide
+                                git lfs install --system 2>\$null; \$LASTEXITCODE = 0
+
+                                git clone ``
+                                    --branch \$unityBranch ``
+                                    --progress ``
+                                    \$credUrl ``
+                                    \$unityWs
+
+                                Set-Location \$unityWs
+                                git lfs pull
+                            }
+
+                            \$sha = git rev-parse HEAD
+                            Write-Host "Unity repo SHA: \$sha"
+                            \$sha | Out-File -FilePath "\$env:WORKSPACE\\unity.sha" -Encoding utf8 -NoNewline
+                        """
+                    }
+
+                    env.UNITY_SHA = powershell(
+                        script: "Get-Content -Raw \"\$env:WORKSPACE\\unity.sha\"",
+                        returnStdout: true
+                    ).trim()
+                    env.UNITY_SHA_SHORT = env.UNITY_SHA.take(8)
+                    echo "Unity repo SHA: ${env.UNITY_SHA_SHORT}"
+                }
+            }
+        }
+
+        // ── 3. SHA-BASED SKIP CHECK ───────────────────────────────────
+        stage('Check If Export Needed') {
+            steps {
+                script {
+                    if (params.FORCE_EXPORT) {
+                        echo 'FORCE_EXPORT=true -- skipping SHA check, will always export'
+                        env.EXPORT_NEEDED = 'true'
+                        return
+                    }
+
+                    def shaFile = "${WORKSPACE}\\${SHA_TRACKING_FILE}"
+
+                    if (fileExists(shaFile)) {
+                        def lastExportedSha = readFile(shaFile).trim()
+                        echo "Last exported Unity SHA : ${lastExportedSha}"
+                        echo "Current  Unity SHA      : ${env.UNITY_SHA}"
+
+                        if (lastExportedSha == env.UNITY_SHA) {
+                            echo 'Unity repo unchanged since last export -- skipping export'
+                            env.EXPORT_NEEDED = 'false'
+                        } else {
+                            echo 'Unity repo has changed -- export required'
+                            env.EXPORT_NEEDED = 'true'
+                        }
+                    } else {
+                        echo "SHA tracking file not found (${SHA_TRACKING_FILE}) -- export required"
+                        env.EXPORT_NEEDED = 'true'
+                    }
+                }
+            }
+        }
+
+        // ── 4. UNITY LOCK CHECK ───────────────────────────────────────
+        stage('Check Unity Workspace Lock') {
+            when { expression { env.EXPORT_NEEDED == 'true' } }
+            steps {
+                powershell """
+                    \$ErrorActionPreference = 'Stop'
+                    \$lockFile = '${UNITY_WORKSPACE}\\Temp\\UnityLockfile'
+
+                    if (-not (Test-Path \$lockFile)) {
+                        Write-Host "No Unity lock file found -- workspace is free"
+                        exit 0
+                    }
+
+                    \$lockAge        = (Get-Date) - (Get-Item \$lockFile).LastWriteTime
+                    \$lockAgeSeconds = [int]\$lockAge.TotalSeconds
+                    Write-Host "Unity lock file age: \${lockAgeSeconds}s  (stale threshold: ${LOCK_STALE_SECONDS}s)"
+
+                    if (\$lockAgeSeconds -gt ${LOCK_STALE_SECONDS}) {
+                        Write-Host "Lock file is STALE (age \${lockAgeSeconds}s > ${LOCK_STALE_SECONDS}s) -- removing and continuing"
+                        Remove-Item \$lockFile -Force
+                    } else {
+                        Write-Host "Unity appears to be running (lock age \${lockAgeSeconds}s < ${LOCK_STALE_SECONDS}s)"
+                        Write-Host "Waiting up to 10 minutes for Unity to finish..."
+
+                        \$maxWait  = 600   # seconds
+                        \$interval = 15
+                        \$elapsed  = 0
+
+                        while ((Test-Path \$lockFile) -and \$elapsed -lt \$maxWait) {
+                            Start-Sleep -Seconds \$interval
+                            \$elapsed += \$interval
+                            Write-Host "  still waiting... (\${elapsed}s elapsed)"
+                        }
+
+                        if (Test-Path \$lockFile) {
+                            Write-Error "Unity lock file still present after \${maxWait}s -- aborting to avoid corrupting Unity project"
+                            exit 1
+                        }
+                        Write-Host "Lock released -- proceeding with export"
+                    }
+                """
+            }
+        }
+
+        // ── 5. UNITY BATCH EXPORT ─────────────────────────────────────
+        stage('Unity Export Android') {
+            when { expression { env.EXPORT_NEEDED == 'true' } }
+            steps {
+                powershell """
+                    \$ErrorActionPreference = 'Stop'
+
+                    \$unityExe     = '${UNITY_EXE}'
+                    \$projectPath  = '${UNITY_WORKSPACE}'
+                    \$logFile      = "\$env:WORKSPACE\\${UNITY_LOG_FILE}"
+                    \$exportTarget = "\$env:WORKSPACE\\${UNITY_LIB_DEST}"
+
+                    # Ensure output directory is clean
+                    if (Test-Path \$exportTarget) {
+                        Remove-Item \$exportTarget -Recurse -Force
+                    }
+                    New-Item -ItemType Directory -Force -Path \$exportTarget | Out-Null
+
+                    Write-Host "Starting Unity headless export..."
+                    Write-Host "  Unity exe   : \$unityExe"
+                    Write-Host "  Project path: \$projectPath"
+                    Write-Host "  Export dest : \$exportTarget"
+                    Write-Host "  Log file    : \$logFile"
+
+                    # Pass the export path via environment variable so HeadlessExporter.cs can read it
+                    \$env:UNITY_EXPORT_PATH = \$exportTarget
+
+                    # Build argument list for Unity batch mode
+                    \$unityArgs = @(
+                        '-batchmode',
+                        '-nographics',
+                        '-quit',
+                        '-projectPath', \$projectPath,
+                        '-executeMethod', 'HeadlessExporter.ExportAndroid',
+                        '-logFile',      \$logFile,
+                        '-buildTarget',  'Android'
+                    )
+
+                    Write-Host "Launching: \$unityExe \$(\$unityArgs -join ' ')"
+
+                    \$process = Start-Process ``
+                        -FilePath    \$unityExe ``
+                        -ArgumentList \$unityArgs ``
+                        -NoNewWindow ``
+                        -Wait ``
+                        -PassThru
+
+                    # Show the last 150 lines of the Unity log for CI visibility
+                    Write-Host "=== Unity log (last 150 lines) ==="
+                    if (Test-Path \$logFile) {
+                        Get-Content \$logFile | Select-Object -Last 150
+                    } else {
+                        Write-Host "(log file not found)"
+                    }
+
+                    if (\$process.ExitCode -ne 0) {
+                        Write-Host "=== Full Unity log ==="
+                        if (Test-Path \$logFile) { Get-Content \$logFile }
+                        Write-Error "Unity exited with code \$(\$process.ExitCode)"
+                        exit \$process.ExitCode
+                    }
+
+                    Write-Host "Unity export completed successfully (exit code 0)"
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: "${UNITY_LOG_FILE}",
+                        allowEmptyArchive: true,
+                        fingerprint: false
+                    )
+                }
+            }
+        }
+
+        // ── 6. VERIFY UNITY LIBRARY ───────────────────────────────────
+        stage('Verify unityLibrary') {
+            when { expression { env.EXPORT_NEEDED == 'true' } }
+            steps {
+                powershell """
+                    \$ErrorActionPreference = 'Stop'
+                    \$libDir = "\$env:WORKSPACE\\${UNITY_LIB_DEST}"
+
+                    Write-Host "Verifying unityLibrary at \$libDir"
+
+                    # Required key files
+                    \$required = @(
+                        'build.gradle',
+                        'src\\main\\AndroidManifest.xml'
+                    )
+
+                    foreach (\$rel in \$required) {
+                        \$full = Join-Path \$libDir \$rel
+                        if (-not (Test-Path \$full)) {
+                            Write-Error "Missing required file: \$full"
+                            exit 1
+                        }
+                        Write-Host "  [OK] \$rel"
+                    }
+
+                    # Sanity check: native libraries
+                    \$soFiles = Get-ChildItem -Path \$libDir -Filter '*.so' -Recurse -ErrorAction SilentlyContinue
+                    if (\$soFiles.Count -eq 0) {
+                        Write-Host "  [WARN] No .so native library files found in unityLibrary"
+                        Write-Host "         This is normal for a pure-C# Unity project using Mono."
+                    } else {
+                        Write-Host "  [OK] \$(\$soFiles.Count) native .so file(s) found"
+                        \$soFiles | Select-Object -First 5 | ForEach-Object { Write-Host "       \$(\$_.Name)" }
+                    }
+
+                    # Inject keepUnitySymbols.gradle patch to avoid duplicate .so errors in Flutter build
+                    \$patchFile = Join-Path \$libDir 'keepUnitySymbols.gradle'
+                    if (-not (Test-Path \$patchFile)) {
+                        Write-Host "  Creating keepUnitySymbols.gradle patch..."
+                        \$patchContent = @'
+// Auto-generated by Jenkins unity-export pipeline
+// Prevents duplicate symbol errors when embedding unityLibrary in Flutter
+configurations.all {
+    resolutionStrategy {
+        force 'com.unity3d.player:UnityPlayer:+'
+    }
+}
+android {
+    packagingOptions {
+        pickFirst '**/*.so'
+        pickFirst '**/libunity.so'
+        pickFirst '**/libil2cpp.so'
+        pickFirst '**/libmain.so'
+    }
+}
+'@
+                        \$patchContent | Set-Content -Path \$patchFile -Encoding utf8
+                        Write-Host "  [OK] keepUnitySymbols.gradle created"
+                    }
+
+                    # Summary
+                    \$totalSize = (Get-ChildItem -Path \$libDir -Recurse -File |
+                        Measure-Object -Property Length -Sum).Sum
+                    Write-Host ""
+                    Write-Host "unityLibrary total size : \$([math]::Round(\$totalSize / 1MB, 1)) MB"
+                    Write-Host "Verification PASSED"
+                """
+            }
+        }
+
+        // ── 7. ARCHIVE UNITY LIBRARY ──────────────────────────────────
+        stage('Archive unityLibrary.zip') {
+            when { expression { env.EXPORT_NEEDED == 'true' } }
+            steps {
+                powershell """
+                    \$ErrorActionPreference = 'Stop'
+                    \$libDir    = "\$env:WORKSPACE\\${UNITY_LIB_DEST}"
+                    \$zipDest   = "\$env:WORKSPACE\\unityLibrary.zip"
+                    \$stageRoot = "\$env:WORKSPACE\\_unity_stage"
+                    \$stageDest = "\$stageRoot\\unityLibrary"
+
+                    if (Test-Path \$zipDest)   { Remove-Item \$zipDest   -Force }
+                    if (Test-Path \$stageRoot) { Remove-Item \$stageRoot -Recurse -Force }
+                    New-Item -ItemType Directory -Force -Path \$stageDest | Out-Null
+
+                    Write-Host "Staging unityLibrary (excluding build/.cxx/symbols) via robocopy..."
+
+                    # /E  = include all subdirectories
+                    # /XD = exclude these directory names wherever they appear
+                    # /NFL /NDL /NJH /NJS = suppress file/dir/header/summary output (quiet)
+                    # /R:2 /W:2 = 2 retries, 2-second wait on failure
+                    robocopy `\$libDir `\$stageDest ``
+                        /E ``
+                        /XD build .cxx symbols .gradle ``
+                        /NFL /NDL /NJH /NJS ``
+                        /R:2 /W:2
+
+                    # robocopy exit codes 0-7 are success (bit-flags for files/dirs copied)
+                    if (\$LASTEXITCODE -gt 7) {
+                        Write-Error "robocopy failed with exit code \$LASTEXITCODE"
+                        exit 1
+                    }
+
+                    Write-Host "Creating zip archive..."
+                    Compress-Archive ``
+                        -Path "\$stageRoot\\*" ``
+                        -DestinationPath \$zipDest ``
+                        -CompressionLevel Optimal ``
+                        -Force
+
+                    \$zipSizeMB = [math]::Round((Get-Item \$zipDest).Length / 1MB, 1)
+                    Write-Host "unityLibrary.zip: \${zipSizeMB} MB"
+
+                    # Cleanup staging directory
+                    Remove-Item \$stageRoot -Recurse -Force
+                """
+                archiveArtifacts(
+                    artifacts: 'unityLibrary.zip',
+                    fingerprint: true
+                )
+            }
+        }
+
+        // ── 8. COMMIT UNITY LIBRARY BACK TO FLUTTER REPO ─────────────
+        stage('Commit unityLibrary to Flutter Repo') {
+            when { expression { env.EXPORT_NEEDED == 'true' } }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "${GIT_CRED_ID}",
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_PASS'
+                )]) {
+                    powershell """
+                        \$ErrorActionPreference = 'Stop'
+                        Set-Location "\$env:WORKSPACE"
+
+                        # Configure git identity for the automated commit
+                        git config user.email "jenkins@ci.local"
+                        git config user.name  "Jenkins Unity Export"
+
+                        # Inject credentials into remote URL
+                        \$flutterUrlNoScheme = '${FLUTTER_REPO_URL}' -replace '^https?://', ''
+                        git remote set-url origin "https://\$(\$env:GIT_USER):\$(\$env:GIT_PASS)@\$flutterUrlNoScheme"
+
+                        # Stage the exported unityLibrary
+                        git add '${UNITY_LIB_DEST}'
+
+                        # Update and stage the SHA tracking file
+                        '${env.UNITY_SHA}' | Out-File -FilePath '${SHA_TRACKING_FILE}' -Encoding utf8 -NoNewline
+                        git add '${SHA_TRACKING_FILE}'
+
+                        # Check if there are staged changes
+                        \$stagedFiles = git diff --cached --name-only
+                        if (-not \$stagedFiles) {
+                            Write-Host "No changes to commit -- unityLibrary is already up to date"
+                            exit 0
+                        }
+
+                        Write-Host "Committing the following files:"
+                        \$stagedFiles | ForEach-Object { Write-Host "  \$_" }
+
+                        \$commitMsg = @"
+[ci] Update unityLibrary from Unity@${env.UNITY_SHA_SHORT}
+
+Unity repo SHA : ${env.UNITY_SHA}
+Flutter branch : ${env.FLUTTER_BRANCH}
+Jenkins build  : #${BUILD_NUMBER}
+Exported by    : Jenkinsfile.unity-export
+[skip ci]
+"@
+                        git commit -m \$commitMsg
+
+                        # Push to the same branch that triggered this build
+                        git push origin "HEAD:${env.FLUTTER_BRANCH}"
+                        Write-Host "Successfully pushed unityLibrary update to branch: ${env.FLUTTER_BRANCH}"
+                    """
+                }
+            }
+        }
+
+        // ── 9. TRIGGER MAIN FLUTTER BUILD ────────────────────────────
+        stage('Trigger Flutter Build') {
+            when { expression { env.EXPORT_NEEDED == 'true' } }
+            steps {
+                script {
+                    // Note: [skip ci] in the commit prevents webhook-triggered infinite loops.
+                    // We also trigger explicitly here so the Flutter build starts immediately.
+                    // Adjust job name to match your multibranch pipeline folder/name.
+                    try {
+                        build(
+                            job: "${APP_NAME}/${env.FLUTTER_BRANCH.replace('/', '%2F')}",
+                            wait: false,
+                            propagate: false,
+                            parameters: [
+                                booleanParam(name: 'DISTRIBUTE', value: false)
+                            ]
+                        )
+                        echo "Triggered Flutter build for branch: ${env.FLUTTER_BRANCH}"
+                    } catch (Exception e) {
+                        // Non-fatal: the commit + SCM webhook will handle triggering
+                        echo "Could not trigger flutter build directly: ${e.message}"
+                        echo "The SCM webhook on the Flutter repo will trigger it automatically."
+                    }
+                }
+            }
+        }
+
+    } // end stages
+
+    post {
+        success {
+            script {
+                if (env.EXPORT_NEEDED == 'true') {
+                    echo "Unity export SUCCEEDED -- unityLibrary@${env.UNITY_SHA_SHORT} committed to Flutter repo"
+                } else {
+                    echo "Unity export SKIPPED -- SHA unchanged (${env.UNITY_SHA_SHORT}), no work needed"
+                }
+            }
+        }
+        failure {
+            echo "Unity export FAILED -- check the ${UNITY_LOG_FILE} artifact for details"
+        }
+        always {
+            // Clean temp files; keep log for debugging
+            powershell '''
+                $ws = $env:WORKSPACE
+                Remove-Item -Path "$ws\\unityLibrary.zip" -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path "$ws\\unity.sha"        -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path "$ws\\_unity_stage"     -Recurse -Force -ErrorAction SilentlyContinue
+            '''
+        }
+    }
+}
